@@ -1,48 +1,63 @@
-# AI Assistant — Bundled Add-on (Step 1 scaffold)
+# AI Assistant — Bundled Add-on
 
-This bundled add-on is the first step of the plan in
+This bundled add-on implements the user-facing AI surface for Blender,
+following the plan in
 [`doc/guides/ai_assistant_plan.md`](../../../doc/guides/ai_assistant_plan.md).
-It introduces the user-facing surface (chat panel + preferences) and the
-internal harness skeleton (provider + tool interfaces) without making
-any network calls.
 
-## What ships in step 1
+Steps **1** (scaffold) and **2** (real streaming providers) have landed.
+Step 3 (tool harness against `bpy.ops`) is next.
 
-* **N-panel "AI"** in the 3D Viewport sidebar with a chat list, draft
-  field, **Send**, **Clear**, and a collapsible **Quick Prompts** sub-panel.
-* **Preferences** (Edit > Preferences > Add-ons > AI Assistant) for
-  provider, model, API-key env var, system prompt, and tool-permission
-  mode.
-* **Harness skeleton** (`harness.py`) defining the `Provider`,
-  `ToolSpec`, and `ToolRegistry` interfaces, plus an offline
-  `EchoProvider` that echoes the last user message back. This is the
-  contract that real providers (step 2) and real tools (step 3) plug
-  into.
+## What ships now
+
+* **N-panel "AI"** in the 3D Viewport sidebar — chat list, draft input,
+  **Send** / **Stop** / **Clear**, plus a collapsible **Quick Prompts**
+  sub-panel.
+* **Preferences** (Edit > Preferences > Add-ons > AI Assistant) — provider,
+  model, base URL, API-key env var, max tokens, system prompt, and a
+  global tool-permission mode.
+* **Streaming providers** (step 2):
+    * **Anthropic** — Messages API SSE (`content_block_delta` text deltas).
+    * **OpenAI** — `/chat/completions` SSE.
+    * **OpenAI-compatible** — same client, custom `base_url` for self-hosted
+      endpoints (vLLM, llama.cpp server, LM Studio, …).
+    * **Echo** — offline fallback used when no key is configured; also
+      surfaces *why* the real provider was skipped.
+* **Threaded request loop** — provider calls run on a worker thread; chunks
+  are drained on the main thread by a `bpy.app.timers` callback that updates
+  the chat message in place and calls `area.tag_redraw()`. Pressing **Stop**
+  signals the worker via a `threading.Event`.
+* **API-key resolution** — `os.environ[<env-var>]` first, then a key file at
+  `$XDG_CONFIG_HOME/blender/ai_assistant/<env-var>` (defaults to
+  `~/.config/blender/ai_assistant/<env-var>`). Keys are never written to the
+  `.blend` file.
 * **Default-enabled** on factory startup via the entry added in
   `BKE_blendfile_userdef_from_defaults`.
 
-## What does **not** ship in step 1
+## What does **not** ship yet
 
-* No real HTTP requests to Anthropic / OpenAI.
-* No streaming.
-* No tool execution against `bpy.ops` or generated Python.
-* No background or parallel agents.
-* No new editor space at the C level.
-
-These are tracked in steps 2–8 of the plan.
+* No tool execution against `bpy.ops` or generated Python (step 3).
+* No permission gating UI (step 4).
+* No background / parallel agents (step 5).
+* No MCP bridge (step 6).
+* No dedicated AI editor space at the C level (step 7).
 
 ## Trying it out
 
-After building Blender from this branch (see "macOS .dmg" below):
+After building Blender from this branch:
 
-1. Launch Blender.
-2. In the 3D Viewport, press `N` to open the sidebar.
-3. Click the **AI** tab.
-4. Type a message and press **Send** — the offline echo provider replies
-   immediately.
+1. Set an API key, e.g. `export ANTHROPIC_API_KEY=sk-...` before launching
+   Blender, or write the key to
+   `~/.config/blender/ai_assistant/ANTHROPIC_API_KEY`.
+2. Launch Blender.
+3. *Edit > Preferences > Add-ons > AI Assistant* — choose **Anthropic** (or
+   **OpenAI** / **OpenAI-compatible**) and set the model id (e.g.
+   `claude-sonnet-4-6`, `gpt-4.1`).
+4. In the 3D Viewport, press `N` and click the **AI** tab.
+5. Type a message and press **Send**. The reply streams in token-by-token;
+   press **Stop** at any time to cancel.
 
-To configure the provider (for when step 2 lands), open
-*Edit > Preferences > Add-ons > AI Assistant*.
+If no key is configured, the offline **Echo** provider runs and the reply
+spells out which env var / key file path it looked for.
 
 ## macOS `.dmg`
 
@@ -71,11 +86,30 @@ addons_core/ai_assistant/`, and the entry in
 
 ```
 ai_assistant/
-├── __init__.py        bl_info, register / unregister
-├── preferences.py     AddonPreferences (provider, model, key, prompt, perms)
-├── properties.py      Per-scene chat session + message PropertyGroup
-├── operators.py       Send / Clear / SetDraft operators
-├── ui.py              N-panel "AI" + Quick Prompts sub-panel
-├── harness.py         Provider, ToolSpec, ToolRegistry, EchoProvider
-└── README.md          this file
+├── __init__.py            bl_info, register / unregister
+├── preferences.py         AddonPreferences (provider, model, key, max-tokens, prompt, perms)
+├── properties.py          Per-scene chat session + message PropertyGroup
+├── operators.py           Send (threaded streaming) / Stop / Clear / SetDraft
+├── ui.py                  N-panel "AI" + Quick Prompts sub-panel
+├── harness.py             Provider / StreamChunk / ToolSpec / ToolRegistry
+├── providers/
+│   ├── __init__.py        build(prefs) factory + exports
+│   ├── base.py            ProviderError
+│   ├── transport.py       SSE POST + key-file fallback (stdlib only)
+│   ├── echo.py            Offline EchoProvider
+│   ├── anthropic.py       AnthropicProvider (Messages API SSE)
+│   └── openai.py          OpenAIProvider (chat/completions SSE)
+└── README.md              this file
 ```
+
+## Implementation notes
+
+* The transport layer uses only the Python standard library
+  (`urllib.request`, `json`) so the add-on works inside Blender's bundled
+  interpreter without extra wheels.
+* The threading model writes only via the main-thread timer callback. The
+  worker thread never touches `bpy` data, which keeps Blender's data model
+  safe under streaming updates.
+* `make_provider()` falls back to `EchoProvider` (with an inline note) when
+  the selected real provider has no API key, so the UI is always usable —
+  the user just sees the configuration hint as the reply.

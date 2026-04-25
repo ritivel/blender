@@ -66,12 +66,14 @@ class VIEW3D_PT_ai_assistant(Panel):
         layout.prop(session, "draft", text="")
 
         row = layout.row(align=True)
-        row.enabled = not session.busy
-        row.operator("ai_assistant.send", icon="PLAY")
+        if session.busy:
+            row.operator("ai_assistant.stop", icon="CANCEL")
+        else:
+            row.operator("ai_assistant.send", icon="PLAY")
         row.operator("ai_assistant.clear", icon="X")
 
         if session.busy:
-            layout.label(text="Thinking…", icon="SORTTIME")
+            layout.label(text="Streaming…", icon="SORTTIME")
 
 
 class VIEW3D_PT_ai_assistant_quickprompts(Panel):

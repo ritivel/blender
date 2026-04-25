@@ -2,33 +2,39 @@
 #
 # SPDX-License-Identifier: GPL-2.0-or-later
 
-"""Agent harness skeleton.
+"""Agent harness — provider, tool, and chunk types.
 
-The harness is the part of the add-on that mediates between the Blender UI
-and an LLM provider. The shape mirrors what we observed in Claude Code,
-OpenAI Codex CLI, and Cursor's Composer:
+The harness mediates between the Blender UI and an LLM provider. It
+mirrors the shape we observed in Claude Code, OpenAI Codex CLI, and
+Cursor Composer:
 
-* A *Provider* turns a list of chat messages into one or more model
-  responses (text and/or tool calls).
+* A *Provider* turns a list of chat messages into a stream of
+  :class:`StreamChunk` objects (text deltas plus errors / done markers).
 * A *Tool* is a typed callable the model can invoke.
-* The *agent loop* alternates ``provider.respond`` and ``tool.run`` until
+* The *agent loop* alternates ``provider.stream`` and ``tool.run`` until
   the model emits a final text answer or a stop condition triggers.
 
-Only the offline ``EchoProvider`` and a single ``noop`` tool exist in this
-step. They are enough to exercise the UI end-to-end and to lock in the
-interface that real providers (step 2) and real tools (step 3) plug into.
+Step 2 wires in real streaming providers (Anthropic, OpenAI,
+OpenAI-compatible). Tool execution still lands in step 3.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Callable, Iterable
+from typing import Callable, Iterable, Iterator
 
 
 @dataclass
 class Message:
     role: str  # "user" | "assistant" | "system" | "tool"
     content: str
+
+
+@dataclass
+class StreamChunk:
+    """One incremental update from a provider."""
+    delta_text: str = ""
+    error: str | None = None
 
 
 @dataclass
@@ -47,26 +53,42 @@ class TurnResult:
 
 
 class Provider:
-    """Provider interface. Real implementations land in step 2."""
+    """Provider interface.
 
-    def respond(self, messages: Iterable[Message], tools: Iterable[ToolSpec]) -> TurnResult:
+    Real implementations override :meth:`stream`. :meth:`respond` collects
+    a stream into one :class:`TurnResult` and is provided as a convenience
+    for synchronous call sites.
+    """
+
+    name = ""
+
+    def stream(
+        self,
+        messages: Iterable[Message],
+        tools: Iterable[ToolSpec],
+    ) -> Iterator[StreamChunk]:
         raise NotImplementedError
 
-
-class EchoProvider(Provider):
-    """Offline provider used to validate the UI without network access."""
-
-    def respond(self, messages: Iterable[Message], tools: Iterable[ToolSpec]) -> TurnResult:
-        last_user = next(
-            (m for m in reversed(list(messages)) if m.role == "user"),
-            None,
-        )
-        text = (
-            "(echo provider — step 1 scaffold)\n"
-            "I received: {!r}\n"
-            "Real providers (Anthropic, OpenAI, OpenAI-compatible) are wired up in step 2."
-        ).format(last_user.content if last_user else "")
-        return TurnResult(messages=[Message(role="assistant", content=text)])
+    def respond(
+        self,
+        messages: Iterable[Message],
+        tools: Iterable[ToolSpec],
+    ) -> TurnResult:
+        text_parts: list[str] = []
+        error: str | None = None
+        for chunk in self.stream(messages, tools):
+            if chunk.error:
+                error = chunk.error
+                break
+            if chunk.delta_text:
+                text_parts.append(chunk.delta_text)
+        msgs: list[Message] = []
+        text = "".join(text_parts)
+        if text:
+            msgs.append(Message(role="assistant", content=text))
+        if error:
+            msgs.append(Message(role="system", content="[error] " + error))
+        return TurnResult(messages=msgs)
 
 
 class ToolRegistry:
@@ -105,8 +127,9 @@ def default_registry() -> ToolRegistry:
 def make_provider(prefs) -> Provider:
     """Construct a provider from add-on preferences.
 
-    Step 1 only knows the offline echo provider. Selecting a real provider
-    in preferences still returns ``EchoProvider`` here; step 2 replaces
-    this dispatch table with real HTTP clients.
+    Lazy-imports :mod:`providers` so this module stays importable in
+    environments where the providers package is not present (e.g. unit
+    tests of the harness shape).
     """
-    return EchoProvider()
+    from . import providers
+    return providers.build(prefs)

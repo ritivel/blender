@@ -11,8 +11,8 @@ assistant, and have the assistant safely drive Blender via tools (bpy
 operators, scene introspection, geometry nodes, generated Python) under a
 permission model the user controls**.
 
-Only **Step 1** of this plan is implemented in the commit that introduces
-this document. Subsequent steps are intentionally deferred so each lands
+**Status:** Step 1 (scaffold) and Step 2 (real streaming providers) are
+implemented. Subsequent steps are intentionally deferred so each lands
 as a small, reviewable change.
 
 ---
@@ -99,13 +99,35 @@ What this **does not** do yet (intentional):
 - No background / parallel agents.
 - No new C-level editor space.
 
-### Step 2 — Real provider clients + streaming
+### Step 2 — Real provider clients + streaming  *(landed)*
 
-Implement HTTP providers (Anthropic Messages API, OpenAI Responses /
-Chat Completions API, optional OpenAI-compatible local URL). Run requests
-on a worker thread; surface incremental output via `bpy.app.timers`
-into the chat panel. Honour the `XDG_*` / `~/.config/blender` paths for
-API-key files. Map provider errors to user-visible messages.
+A new `providers/` subpackage adds:
+
+* `AnthropicProvider` — Messages API SSE; parses `content_block_delta`
+  text deltas and stops on `message_stop`.
+* `OpenAIProvider` — `/chat/completions` SSE; assembles `choices[0].delta.content`
+  until `finish_reason` arrives. The same client serves the
+  `OpenAI-compatible` provider (custom `base_url`).
+* `EchoProvider` — offline fallback that streams a canned reply word by
+  word; also used when a real provider is selected but no API key is
+  configured (the reason is surfaced inline).
+* `transport.post_sse` — stdlib-only SSE POST. HTTP errors return a
+  `ProviderError` with the API's own error message extracted from the
+  response body.
+* `transport.resolve_api_key` — `os.environ[<env-var>]` then
+  `$XDG_CONFIG_HOME/blender/ai_assistant/<env-var>` fallback.
+
+The send operator is now non-blocking: a worker thread iterates
+`provider.stream(...)` and pushes `StreamChunk` objects onto a queue;
+a `bpy.app.timers` callback drains the queue on the main thread,
+appends deltas to the placeholder assistant message, and calls
+`area.tag_redraw()`. A **Stop** operator sets a `threading.Event` the
+worker checks between chunks.
+
+Tested without a Blender host via a mock SSE server: Anthropic and
+OpenAI streams assemble correctly end-to-end, HTTP errors surface as
+chunked errors, and the missing-key path falls back to `EchoProvider`
+with a configuration hint.
 
 ### Step 3 — Tool harness ("Atelier")
 

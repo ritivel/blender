@@ -11,7 +11,7 @@ revisit preferences when later steps activate the real providers.
 """
 
 import bpy
-from bpy.props import EnumProperty, StringProperty
+from bpy.props import EnumProperty, IntProperty, StringProperty
 from bpy.types import AddonPreferences
 
 
@@ -70,6 +70,13 @@ class AIAssistantPreferences(AddonPreferences):
         description="Prepended to every conversation",
         default=DEFAULT_SYSTEM_PROMPT,
     )
+    max_tokens: IntProperty(
+        name="Max Tokens",
+        description="Hard cap on response length",
+        default=4096,
+        min=64,
+        soft_max=32768,
+    )
     permission_mode: EnumProperty(
         name="Tool Permissions",
         items=PERMISSION_MODES,
@@ -85,6 +92,7 @@ class AIAssistantPreferences(AddonPreferences):
         if self.provider == "custom":
             col.prop(self, "base_url")
         col.prop(self, "api_key_env")
+        col.prop(self, "max_tokens")
 
         layout.separator()
         layout.label(text="System prompt:")
@@ -95,7 +103,9 @@ class AIAssistantPreferences(AddonPreferences):
 
         layout.separator()
         box = layout.box()
-        box.label(text="Step 1 scaffold — provider clients land in step 2", icon="INFO")
+        box.label(text="API key resolution order:", icon="INFO")
+        box.label(text="  1. Environment variable named above")
+        box.label(text="  2. $XDG_CONFIG_HOME/blender/ai_assistant/<env-var>")
         box.label(text="See doc/guides/ai_assistant_plan.md for the full plan")
 
 

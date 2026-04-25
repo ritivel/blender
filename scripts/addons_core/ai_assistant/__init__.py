@@ -22,7 +22,7 @@ bl_info = {
 if "bpy" in locals():
     import importlib
 
-    for _mod_name in ("harness", "properties", "preferences", "operators", "ui"):
+    for _mod_name in ("harness", "providers", "properties", "preferences", "operators", "ui"):
         if _mod_name in locals():
             importlib.reload(locals()[_mod_name])
 
@@ -30,6 +30,7 @@ if "bpy" in locals():
 import bpy
 
 from . import harness
+from . import providers  # noqa: F401 — registers provider implementations on import
 from . import properties
 from . import preferences
 from . import operators
