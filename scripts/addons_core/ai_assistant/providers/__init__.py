@@ -50,7 +50,11 @@ def build(prefs):
                     prefs.api_key_env, prefs.api_key_env
                 ),
             )
-        return AnthropicProvider(model=prefs.model, api_key=api_key)
+        return AnthropicProvider(
+            model=prefs.model,
+            api_key=api_key,
+            max_tokens=prefs.max_tokens,
+        )
 
     if name == "openai":
         if not api_key:
@@ -60,10 +64,19 @@ def build(prefs):
                     prefs.api_key_env, prefs.api_key_env
                 ),
             )
-        return OpenAIProvider(model=prefs.model, api_key=api_key)
+        return OpenAIProvider(
+            model=prefs.model,
+            api_key=api_key,
+            max_tokens=prefs.max_tokens,
+        )
 
     if name == "custom":
         base_url = prefs.base_url.strip() or "http://localhost:8080/v1"
-        return OpenAIProvider(model=prefs.model, api_key=api_key or "sk-local", base_url=base_url)
+        return OpenAIProvider(
+            model=prefs.model,
+            api_key=api_key or "sk-local",
+            base_url=base_url,
+            max_tokens=prefs.max_tokens,
+        )
 
     return EchoProvider(note="Unknown provider {!r}".format(name))

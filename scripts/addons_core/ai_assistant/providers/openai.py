@@ -30,10 +30,12 @@ class OpenAIProvider:
         model: str,
         api_key: str,
         base_url: str = _DEFAULT_BASE_URL,
+        max_tokens: int = 4096,
     ):
         self.model = model
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
+        self.max_tokens = max_tokens
 
     def stream(
         self,
@@ -52,6 +54,7 @@ class OpenAIProvider:
         body = {
             "model": self.model,
             "messages": chat,
+            "max_tokens": self.max_tokens,
             "stream": True,
         }
         headers = {"authorization": "Bearer " + self.api_key}
