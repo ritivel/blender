@@ -114,10 +114,40 @@ class VIEW3D_PT_ai_assistant_quickprompts(Panel):
             op.text = prompt
 
 
+class VIEW3D_PT_ai_assistant_trust(Panel):
+    """Tools the user has trusted for the lifetime of this .blend file.
+
+    Step 4 surface: per-project trust is persisted in the scene's
+    ``ai_assistant.trusted_tools`` collection so it survives a Blender
+    restart. The panel exposes a one-click revoke for each entry.
+    """
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "AI"
+    bl_label = "Trusted Tools (this project)"
+    bl_parent_id = "VIEW3D_PT_ai_assistant"
+    bl_options = {"DEFAULT_CLOSED"}
+
+    def draw(self, context):
+        layout = self.layout
+        session = context.scene.ai_assistant
+        if not len(session.trusted_tools):
+            layout.label(text="No tools trusted yet.", icon="LOCKED")
+            layout.label(text="Saved with the .blend file.")
+            return
+        for entry in session.trusted_tools:
+            row = layout.row(align=True)
+            row.label(text=entry.name, icon="TOOL_SETTINGS")
+            op = row.operator("ai_assistant.revoke_trust", text="", icon="X")
+            op.scope = "project"
+            op.tool_name = entry.name
+
+
 _classes = (
     AI_ASSISTANT_UL_messages,
     VIEW3D_PT_ai_assistant,
     VIEW3D_PT_ai_assistant_quickprompts,
+    VIEW3D_PT_ai_assistant_trust,
 )
 
 

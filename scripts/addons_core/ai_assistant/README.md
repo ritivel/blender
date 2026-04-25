@@ -4,8 +4,9 @@ This bundled add-on implements the user-facing AI surface for Blender,
 following the plan in
 [`doc/guides/ai_assistant_plan.md`](../../../doc/guides/ai_assistant_plan.md).
 
-Steps **1** (scaffold), **2** (real streaming providers), and **3**
-(typed tool harness with the first tool set) have landed.
+Steps **1** (scaffold), **2** (real streaming providers), **3**
+(typed tool harness with the first tool set), and **4** (per-call
+permission gate with session and per-project trust) have landed.
 
 ## What ships now
 
@@ -37,6 +38,19 @@ Steps **1** (scaffold), **2** (real streaming providers), and **3**
       tools run on the main thread, results flow back into the
       conversation, loop continues until the model finishes or a
       hard-stop limit is reached.
+* **Per-call permission gate** (step 4):
+    * Every non-`read` tool call goes through
+      `permissions.decide(...)` before it runs.
+    * `Ask each time` mode opens the modal **AI Assistant — Confirm
+      Tool** popup with four options (mirrors Claude Code):
+      *Allow once*, *Allow for this session*, *Always for this
+      project*, *Deny*.
+    * **Session trust** is process-local; **project trust** is saved
+      with the .blend file on `Scene.ai_assistant.trusted_tools`.
+    * Pressing **Stop** while a popup is open resolves it as a
+      denial so the loop can unwind.
+    * The full tool catalogue is now advertised to the model in any
+      non-`Deny all` mode (gating is per-call, not list-filter).
 * **Threaded request loop** — provider calls run on a worker thread; chunks
   are drained on the main thread by a `bpy.app.timers` callback that updates
   the chat message in place and calls `area.tag_redraw()`. Pressing **Stop**
@@ -50,10 +64,6 @@ Steps **1** (scaffold), **2** (real streaming providers), and **3**
 
 ## What does **not** ship yet
 
-* No modal permission popup — the global Tool Permissions mode (in
-  preferences) acts as the floor: `Deny` blocks tools, `Ask each time`
-  and `Allow for session` only expose read-only tools, and `Always
-  allow` exposes the full set. Per-call confirmation comes in step 4.
 * No background / parallel agents (step 5).
 * No MCP bridge (step 6).
 * No dedicated AI editor space at the C level (step 7).
@@ -106,9 +116,10 @@ ai_assistant/
 ├── __init__.py            bl_info, register / unregister
 ├── preferences.py         AddonPreferences (provider, model, key, max-tokens, prompt, perms)
 ├── properties.py          Per-scene chat session + message PropertyGroup (user/assistant/system/tool roles)
-├── operators.py           Send / Stop / Clear / SetDraft + multi-step agent loop
-├── ui.py                  N-panel "AI" + Quick Prompts sub-panel
+├── operators.py           Send / Stop / Clear / SetDraft / PermissionPrompt / RevokeTrust + multi-step gated agent loop
+├── ui.py                  N-panel "AI" + Quick Prompts + Trusted Tools sub-panels
 ├── harness.py             Provider / StreamChunk / ToolSpec / ToolCall / ToolRegistry
+├── permissions.py         Per-call decision gate + session/project trust
 ├── providers/
 │   ├── __init__.py        build(prefs) factory + exports
 │   ├── base.py            ProviderError

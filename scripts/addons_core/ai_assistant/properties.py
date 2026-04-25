@@ -46,8 +46,25 @@ class AIAssistantMessage(PropertyGroup):
     )
 
 
+class AIAssistantTrustedTool(PropertyGroup):
+    """A tool the user has trusted for the lifetime of the .blend file.
+
+    Step 4 of the plan introduces per-project trust as one of the four
+    answers to the modal permission popup ("Always for this project").
+    Storing the trusted tools in a CollectionProperty on the per-scene
+    session makes them persist with the .blend file alongside the chat
+    history; they survive a Blender restart but never escape the file.
+    """
+    name: StringProperty(
+        name="Tool",
+        description="Fully-qualified tool name (e.g. mesh.add_primitive)",
+        default="",
+    )
+
+
 class AIAssistantSession(PropertyGroup):
     messages: CollectionProperty(type=AIAssistantMessage)
+    trusted_tools: CollectionProperty(type=AIAssistantTrustedTool)
     draft: StringProperty(
         name="Message",
         description="Text to send to the AI assistant",
@@ -63,6 +80,7 @@ class AIAssistantSession(PropertyGroup):
 
 _classes = (
     AIAssistantMessage,
+    AIAssistantTrustedTool,
     AIAssistantSession,
 )
 

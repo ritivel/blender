@@ -5,16 +5,17 @@
 bl_info = {
     "name": "AI Assistant",
     "author": "Blender Foundation",
-    "version": (0, 3, 0),
+    "version": (0, 4, 0),
     "blender": (5, 0, 0),
     "location": "View3D > Sidebar > AI",
     "description": (
         "Conversational AI assistant for Blender with streaming providers "
         "(Anthropic, OpenAI, OpenAI-compatible) and a typed tool harness "
         "for scene introspection, mesh creation, transforms, and gated "
-        "operator / Python-eval execution."
+        "operator / Python-eval execution. Step 4 adds a per-call "
+        "permission popup with session and per-project trust."
     ),
-    "warning": "Experimental. Tool execution is gated by the global permission mode in preferences.",
+    "warning": "Experimental. Tool execution is gated per-call by the permission popup.",
     "doc_url": "{BLENDER_MANUAL_URL}/addons/system/ai_assistant.html",
     "support": "OFFICIAL",
     "category": "System",
@@ -24,7 +25,10 @@ bl_info = {
 if "bpy" in locals():
     import importlib
 
-    for _mod_name in ("harness", "providers", "tools", "properties", "preferences", "operators", "ui"):
+    for _mod_name in (
+        "harness", "permissions", "providers", "tools",
+        "properties", "preferences", "operators", "ui",
+    ):
         if _mod_name in locals():
             importlib.reload(locals()[_mod_name])
 
@@ -32,6 +36,7 @@ if "bpy" in locals():
 import bpy
 
 from . import harness
+from . import permissions  # noqa: F401 — pure-Python; consulted by operators
 from . import providers  # noqa: F401 — registers provider implementations on import
 from . import tools  # noqa: F401 — registered lazily by harness.default_registry()
 from . import properties
@@ -47,6 +52,8 @@ def register():
     ui.register()
     # Reset the cached default registry so reloads pick up new tool defs.
     harness.reset_default_registry()
+    # Clear any session-trusted tools left over from a previous load.
+    permissions.clear_session()
 
 
 def unregister():
@@ -55,3 +62,4 @@ def unregister():
     preferences.unregister()
     properties.unregister()
     harness.reset_default_registry()
+    permissions.clear_session()

@@ -34,11 +34,12 @@ from typing import Callable, Iterable, Iterator
 #   "write" — mutates scene / datablocks; reversible via undo.
 #   "exec"  — arbitrary code (Python eval, raw bpy.ops). Most dangerous.
 #
-# Step 4 promotes these into a modal permission popup. Until then the
-# agent loop in :mod:`operators` only respects ``deny`` (no tools at all)
-# and ``always`` (run everything). ``ask``/``session`` modes filter the
-# tool list down to ``read``-only tools so the model cannot mutate the
-# scene without an explicit opt-in.
+# Step 4 introduces a per-call permission gate: every non-``read``
+# tool call is resolved by :mod:`permissions` before it runs (auto-allow
+# in ``always`` mode, denied in ``deny`` mode, otherwise prompted). The
+# gate replaces the coarse list-filter we used in step 3 — in any
+# non-``deny`` mode the full tool catalogue is now exposed to the model
+# so it can reason about what to do *before* the user is asked.
 PERMISSIONS = ("read", "write", "exec")
 
 
@@ -236,16 +237,13 @@ def make_provider(prefs) -> Provider:
 
 
 def allowed_permissions(permission_mode: str) -> set[str]:
-    """Return the set of permission classes enabled by a UI mode.
+    """Return the set of permission classes the model is *told* about.
 
-    Used by the agent loop to filter the tool list before sending it to
-    the provider. Step 4 will replace this with a modal popup that asks
-    per-tool, but the same coarse mapping defines the floor: ``deny``
-    blocks every tool, ``ask`` and ``session`` permit only read tools,
-    and ``always`` permits everything.
+    With the per-call gate introduced in step 4, the floor is just
+    ``deny`` (no tools advertised) versus everything else (full tool
+    catalogue advertised). The decision of whether any individual call
+    actually runs is taken later by :func:`permissions.decide`.
     """
     if permission_mode == "deny":
         return set()
-    if permission_mode in ("ask", "session"):
-        return {"read"}
     return {"read", "write", "exec"}

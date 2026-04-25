@@ -13,6 +13,8 @@ import bpy
 from bpy.props import EnumProperty, IntProperty, StringProperty
 from bpy.types import AddonPreferences
 
+from . import permissions
+
 
 PROVIDERS = (
     ("echo", "Echo (offline)", "Local stub provider; streams a canned reply with a configuration hint"),
@@ -23,10 +25,26 @@ PROVIDERS = (
 
 
 PERMISSION_MODES = (
-    ("ask", "Ask each time", "Prompt for confirmation before every tool call"),
-    ("session", "Allow for session", "Confirm once per tool, then trust for the rest of the session"),
-    ("always", "Always allow", "Run tools without prompting (development only)"),
-    ("deny", "Deny all", "Disable tool execution entirely"),
+    (
+        "ask",
+        "Ask each time",
+        "Show the modal permission popup before every write/exec tool call",
+    ),
+    (
+        "session",
+        "Allow for session",
+        "Show the popup once per tool; remember the answer until Blender exits",
+    ),
+    (
+        "always",
+        "Always allow",
+        "Run every tool the model requests without prompting (development only)",
+    ),
+    (
+        "deny",
+        "Deny all",
+        "Block every tool call. The model is told tools are unavailable",
+    ),
 )
 
 
@@ -105,6 +123,23 @@ class AIAssistantPreferences(AddonPreferences):
 
         layout.separator()
         layout.prop(self, "permission_mode")
+
+        # Per-call popup decisions accumulate here until the user
+        # exits Blender or actively revokes them. Render the list so
+        # the user can see what they have trusted.
+        session_trusted = permissions.session_trusted_tools()
+        if session_trusted:
+            layout.separator()
+            box = layout.box()
+            box.label(text="Tools trusted for this session:", icon="UNLOCKED")
+            for name in session_trusted:
+                row = box.row(align=True)
+                row.label(text=name, icon="TOOL_SETTINGS")
+                op = row.operator(
+                    "ai_assistant.revoke_trust", text="", icon="X",
+                )
+                op.scope = "session"
+                op.tool_name = name
 
         layout.separator()
         box = layout.box()

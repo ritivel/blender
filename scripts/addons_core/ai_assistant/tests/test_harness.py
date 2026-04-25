@@ -82,9 +82,18 @@ class PermissionModeTest(unittest.TestCase):
     def test_deny_blocks_all_tools(self):
         self.assertEqual(harness.allowed_permissions("deny"), set())
 
-    def test_ask_and_session_only_permit_read(self):
-        self.assertEqual(harness.allowed_permissions("ask"), {"read"})
-        self.assertEqual(harness.allowed_permissions("session"), {"read"})
+    def test_ask_and_session_advertise_full_catalogue(self):
+        # Step 4 moves the gate from list-filtering to per-call: in any
+        # non-`deny` mode the model sees every tool, but write/exec
+        # calls are then individually gated by `permissions.decide`.
+        self.assertEqual(
+            harness.allowed_permissions("ask"),
+            {"read", "write", "exec"},
+        )
+        self.assertEqual(
+            harness.allowed_permissions("session"),
+            {"read", "write", "exec"},
+        )
 
     def test_always_permits_every_class(self):
         self.assertEqual(
