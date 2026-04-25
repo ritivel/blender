@@ -4,18 +4,32 @@
 
 """Operators backing the AI Assistant chat UI.
 
-Step 2 runs the provider on a worker thread and surfaces incremental
-output to the chat panel via :func:`bpy.app.timers.register`. The worker
-thread never touches ``bpy`` data; all data writes happen on the main
-thread inside the timer callback.
+Step 3 promotes the previously single-shot send into a full agent loop:
 
-A small global ``_state`` object holds the in-flight request. When the
-add-on is unregistered or a Stop is requested, the cancel event is set;
-the worker thread checks the event between chunks and exits.
+1. The send operator builds the initial conversation, picks an
+   in-memory placeholder assistant message, and starts a worker thread
+   that streams from the provider.
+2. The worker thread *only* speaks HTTP — it never touches ``bpy``
+   data. Text deltas and tool-call requests are pushed onto a queue.
+3. A timer callback (:func:`_drain_tick`) drains the queue on the main
+   thread, appends text deltas to the chat, and accumulates pending
+   tool calls.
+4. When the worker emits a ``finish_reason``:
+   * ``stop`` — turn is complete; tear down state.
+   * ``tool_use`` — execute each pending tool call on the main thread,
+     append a tool log entry to the chat, append the tool result to the
+     in-memory history, and spawn a fresh worker for the next round.
+   A hard cap (:data:`_MAX_AGENT_STEPS`) bounds the loop so a model
+   that never produces a final answer cannot wedge the UI.
+
+Tool execution runs on the main thread so it can safely touch
+``bpy.data`` and ``bpy.context``. The cancel event can interrupt the
+worker between chunks and also short-circuits the tool loop.
 """
 
 from __future__ import annotations
 
+import json
 import queue
 import threading
 import weakref
@@ -28,21 +42,35 @@ from . import harness
 from .preferences import get_prefs
 
 
-# Time between timer ticks that drain queued chunks into the chat. Tuned
-# small enough that streaming feels responsive; large enough that we
-# don't spam tag_redraw on idle conversations.
 _TICK_INTERVAL = 0.05
+
+# Hard cap on agent loop iterations within a single user turn. Mirrors
+# the "max-steps" knob in Claude Code / Codex CLI: at the limit we stop
+# even if the model is still asking for more tools, so a buggy or
+# adversarial conversation cannot run unbounded.
+_MAX_AGENT_STEPS = 12
+
+# Cap on how much of a tool result we render into the visible chat log.
+_TOOL_LOG_PREVIEW = 240
 
 
 class _RequestState:
-    __slots__ = ("thread", "queue", "cancel", "scene_ref", "msg_index")
+    __slots__ = (
+        "thread", "queue", "cancel", "scene_ref", "msg_index",
+        "history", "tools", "provider", "step", "pending_tool_calls",
+    )
 
-    def __init__(self, thread, q, cancel, scene, msg_index):
+    def __init__(self, thread, q, cancel, scene, msg_index, history, tools, provider):
         self.thread = thread
         self.queue = q
         self.cancel = cancel
         self.scene_ref = weakref.ref(scene)
         self.msg_index = msg_index
+        self.history: list[harness.Message] = history
+        self.tools: list[harness.ToolSpec] = tools
+        self.provider = provider
+        self.step = 0
+        self.pending_tool_calls: list[harness.ToolCall] = []
 
 
 _state: _RequestState | None = None
@@ -71,20 +99,28 @@ def _append_history_message(
     role: str,
     content: str,
 ) -> None:
-    if history and history[-1].role == role:
+    if history and history[-1].role == role and not history[-1].tool_calls:
         history[-1].content += "\n\n" + content
     else:
         history.append(harness.Message(role=role, content=content))
 
 
 def _build_history(session, system_prompt: str) -> list[harness.Message]:
+    """Reconstruct provider history from persistent chat session.
+
+    ``tool`` and ``tool_call`` messages are skipped. They are present for
+    the user's benefit but are scoped to the turn they originated in;
+    there is no portable way to round-trip Anthropic ``tool_use`` ids
+    across users turns when only flat text is persisted, so we drop them
+    and let the model re-introspect via ``scene.list_objects`` if it
+    needs prior context.
+    """
     system_messages: list[harness.Message] = []
     turns: list[harness.Message] = []
     if system_prompt:
         _append_history_message(system_messages, "system", system_prompt)
     for m in session.messages:
         if not m.content or not m.content.strip():
-            # Skip the empty placeholder we appended for streaming.
             continue
         if m.role == "system":
             _append_history_message(system_messages, "system", m.content)
@@ -105,6 +141,128 @@ def _worker(provider, history, tools, q: queue.Queue, cancel: threading.Event):
         q.put(None)  # Sentinel: stream finished.
 
 
+def _summarise_args(arguments: dict) -> str:
+    try:
+        text = json.dumps(arguments, ensure_ascii=False, sort_keys=True)
+    except (TypeError, ValueError):
+        text = repr(arguments)
+    if len(text) > _TOOL_LOG_PREVIEW:
+        text = text[: _TOOL_LOG_PREVIEW - 1] + "…"
+    return text
+
+
+def _summarise_result(content: str) -> str:
+    text = content or ""
+    if len(text) > _TOOL_LOG_PREVIEW:
+        text = text[: _TOOL_LOG_PREVIEW - 1] + "…"
+    return text
+
+
+def _execute_tool(tool: harness.ToolSpec, arguments: dict) -> harness.ToolResult:
+    try:
+        result_text = tool.run(arguments or {})
+    except Exception as err:  # noqa: BLE001 — surface to the model
+        return harness.ToolResult(
+            call_id="",
+            content="error: {}".format(err),
+            is_error=True,
+        )
+    if not isinstance(result_text, str):
+        result_text = json.dumps(result_text, default=str)
+    return harness.ToolResult(call_id="", content=result_text, is_error=False)
+
+
+def _run_pending_tools(state: _RequestState, session) -> None:
+    """Execute pending tool calls and update history + chat session."""
+    tool_results: list[harness.ToolResult] = []
+    by_name = {t.name: t for t in state.tools}
+
+    for call in state.pending_tool_calls:
+        if state.cancel.is_set():
+            break
+        tool = by_name.get(call.name)
+        if tool is None:
+            log = "[tool] {}({}) → unknown or denied".format(
+                call.name, _summarise_args(call.arguments),
+            )
+            _append_message(session, "tool", log)
+            tool_results.append(harness.ToolResult(
+                call_id=call.id,
+                content="Unknown or denied tool: {}".format(call.name),
+                is_error=True,
+            ))
+            continue
+
+        result = _execute_tool(tool, call.arguments)
+        result.call_id = call.id
+        log = "[tool] {}({}) → {}".format(
+            call.name, _summarise_args(call.arguments), _summarise_result(result.content),
+        )
+        _append_message(session, "tool", log)
+        tool_results.append(result)
+
+    # Record the assistant turn (with tool calls) and the tool results in
+    # the in-memory history so the next provider call sees them.
+    placeholder_idx = state.msg_index
+    if 0 <= placeholder_idx < len(session.messages):
+        assistant_text = session.messages[placeholder_idx].content
+    else:
+        assistant_text = ""
+    state.history.append(harness.Message(
+        role="assistant",
+        content=assistant_text,
+        tool_calls=list(state.pending_tool_calls),
+    ))
+    state.history.append(harness.Message(
+        role="tool",
+        tool_results=tool_results,
+    ))
+    state.pending_tool_calls = []
+
+
+def _start_next_step(state: _RequestState, session) -> bool:
+    """Spawn the next worker thread for this turn. Returns False at hard-stop."""
+    state.step += 1
+    if state.step > _MAX_AGENT_STEPS:
+        if 0 <= state.msg_index < len(session.messages):
+            existing = session.messages[state.msg_index].content
+            sep = "\n\n" if existing else ""
+            session.messages[state.msg_index].content = (
+                existing + sep + "[hard-stop] Agent reached max steps; stopping."
+            )
+        return False
+
+    # New placeholder for the next assistant turn so the user sees a
+    # natural progression in the chat list.
+    state.msg_index = _append_message(session, "assistant", "")
+
+    state.queue = queue.Queue()
+    state.cancel.clear()
+    state.thread = threading.Thread(
+        target=_worker,
+        args=(state.provider, state.history, state.tools, state.queue, state.cancel),
+        daemon=True,
+        name="ai_assistant.worker",
+    )
+    state.thread.start()
+    return True
+
+
+def _finalise(state: _RequestState, session, error: str | None) -> None:
+    """Tear down the request and clear UI busy state."""
+    if error and 0 <= state.msg_index < len(session.messages):
+        existing = session.messages[state.msg_index].content
+        sep = "\n\n" if existing else ""
+        session.messages[state.msg_index].content = existing + sep + "[error] " + error
+    if (
+        not error
+        and 0 <= state.msg_index < len(session.messages)
+        and not session.messages[state.msg_index].content.strip()
+    ):
+        session.messages.remove(state.msg_index)
+    session.busy = False
+
+
 def _drain_tick():
     global _state
     state = _state
@@ -113,7 +271,6 @@ def _drain_tick():
 
     scene = state.scene_ref()
     if scene is None:
-        # Scene was freed; abort.
         state.cancel.set()
         _state = None
         return None
@@ -127,6 +284,7 @@ def _drain_tick():
 
     finished = False
     error: str | None = None
+    finish_reason: str | None = None
     while True:
         try:
             chunk = state.queue.get_nowait()
@@ -141,28 +299,43 @@ def _drain_tick():
             break
         if chunk.delta_text and 0 <= state.msg_index < len(session.messages):
             session.messages[state.msg_index].content += chunk.delta_text
-
-    if error:
-        if 0 <= state.msg_index < len(session.messages):
-            existing = session.messages[state.msg_index].content
-            sep = "\n\n" if existing else ""
-            session.messages[state.msg_index].content = existing + sep + "[error] " + error
+        if chunk.tool_call is not None:
+            state.pending_tool_calls.append(chunk.tool_call)
+        if chunk.finish_reason:
+            finish_reason = chunk.finish_reason
 
     _redraw_view3d()
 
-    if finished:
-        # Drop empty placeholder if model produced nothing and there was no error.
-        if (
-            not error
-            and 0 <= state.msg_index < len(session.messages)
-            and not session.messages[state.msg_index].content.strip()
-        ):
-            session.messages.remove(state.msg_index)
-        session.busy = False
+    if not finished:
+        return _TICK_INTERVAL
+
+    # Stream ended for this provider call.
+    if error:
+        _finalise(state, session, error)
         _state = None
         return None
 
-    return _TICK_INTERVAL
+    if finish_reason == "tool_use" and state.pending_tool_calls and not state.cancel.is_set():
+        _run_pending_tools(state, session)
+        if not _start_next_step(state, session):
+            _finalise(state, session, None)
+            _state = None
+            return None
+        return _TICK_INTERVAL
+
+    # Drop empty placeholder produced by, for instance, a tool-only turn
+    # whose follow-up never arrived.
+    _finalise(state, session, None)
+    _state = None
+    return None
+
+
+def _select_tools(prefs) -> list[harness.ToolSpec]:
+    mode = getattr(prefs, "permission_mode", "ask") if prefs else "ask"
+    allowed = harness.allowed_permissions(mode)
+    if not allowed:
+        return []
+    return harness.default_registry().filter_by_permission(allowed)
 
 
 class AI_ASSISTANT_OT_send(Operator):
@@ -197,7 +370,7 @@ class AI_ASSISTANT_OT_send(Operator):
         session.busy = True
 
         provider = harness.make_provider(prefs)
-        tools = harness.default_registry().all()
+        tools = _select_tools(prefs)
 
         q: queue.Queue = queue.Queue()
         cancel = threading.Event()
@@ -207,7 +380,11 @@ class AI_ASSISTANT_OT_send(Operator):
             daemon=True,
             name="ai_assistant.worker",
         )
-        _state = _RequestState(thread, q, cancel, context.scene, msg_index)
+        _state = _RequestState(
+            thread=thread, q=q, cancel=cancel, scene=context.scene,
+            msg_index=msg_index, history=history, tools=tools, provider=provider,
+        )
+        _state.step = 1
         thread.start()
 
         if not bpy.app.timers.is_registered(_drain_tick):

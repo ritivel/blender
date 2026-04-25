@@ -4,8 +4,8 @@ This bundled add-on implements the user-facing AI surface for Blender,
 following the plan in
 [`doc/guides/ai_assistant_plan.md`](../../../doc/guides/ai_assistant_plan.md).
 
-Steps **1** (scaffold) and **2** (real streaming providers) have landed.
-Step 3 (tool harness against `bpy.ops`) is next.
+Steps **1** (scaffold), **2** (real streaming providers), and **3**
+(typed tool harness with the first tool set) have landed.
 
 ## What ships now
 
@@ -16,12 +16,27 @@ Step 3 (tool harness against `bpy.ops`) is next.
   model, base URL, API-key env var, max tokens, system prompt, and a
   global tool-permission mode.
 * **Streaming providers** (step 2):
-    * **Anthropic** — Messages API SSE (`content_block_delta` text deltas).
-    * **OpenAI** — `/chat/completions` SSE.
+    * **Anthropic** — Messages API SSE (`content_block_delta` text deltas
+      plus `tool_use` content blocks; round-trips `tool_use` + `tool_result`
+      blocks across turns).
+    * **OpenAI** — `/chat/completions` SSE with streamed `tool_calls`
+      assembled per index.
     * **OpenAI-compatible** — same client, custom `base_url` for self-hosted
       endpoints (vLLM, llama.cpp server, LM Studio, …).
     * **Echo** — offline fallback used when no key is configured; also
       surfaces *why* the real provider was skipped.
+* **Tool harness** (step 3):
+    * Typed `ToolSpec` (name, JSON-schema parameters, permission class,
+      callable). Read / write / exec permission classes.
+    * Bundled tool set in `tools/`:
+      `scene.list_objects`, `scene.get_object`, `scene.select`,
+      `mesh.add_primitive`, `transform.translate/rotate/scale`,
+      `bpy.run_operator` (allowlisted), `python.eval_in_sandbox`
+      (restricted namespace), `viewport.screenshot`.
+    * Multi-step agent loop: provider streams text + tool calls,
+      tools run on the main thread, results flow back into the
+      conversation, loop continues until the model finishes or a
+      hard-stop limit is reached.
 * **Threaded request loop** — provider calls run on a worker thread; chunks
   are drained on the main thread by a `bpy.app.timers` callback that updates
   the chat message in place and calls `area.tag_redraw()`. Pressing **Stop**
@@ -35,8 +50,10 @@ Step 3 (tool harness against `bpy.ops`) is next.
 
 ## What does **not** ship yet
 
-* No tool execution against `bpy.ops` or generated Python (step 3).
-* No permission gating UI (step 4).
+* No modal permission popup — the global Tool Permissions mode (in
+  preferences) acts as the floor: `Deny` blocks tools, `Ask each time`
+  and `Allow for session` only expose read-only tools, and `Always
+  allow` exposes the full set. Per-call confirmation comes in step 4.
 * No background / parallel agents (step 5).
 * No MCP bridge (step 6).
 * No dedicated AI editor space at the C level (step 7).
@@ -88,17 +105,25 @@ addons_core/ai_assistant/`, and the entry in
 ai_assistant/
 ├── __init__.py            bl_info, register / unregister
 ├── preferences.py         AddonPreferences (provider, model, key, max-tokens, prompt, perms)
-├── properties.py          Per-scene chat session + message PropertyGroup
-├── operators.py           Send (threaded streaming) / Stop / Clear / SetDraft
+├── properties.py          Per-scene chat session + message PropertyGroup (user/assistant/system/tool roles)
+├── operators.py           Send / Stop / Clear / SetDraft + multi-step agent loop
 ├── ui.py                  N-panel "AI" + Quick Prompts sub-panel
-├── harness.py             Provider / StreamChunk / ToolSpec / ToolRegistry
+├── harness.py             Provider / StreamChunk / ToolSpec / ToolCall / ToolRegistry
 ├── providers/
 │   ├── __init__.py        build(prefs) factory + exports
 │   ├── base.py            ProviderError
 │   ├── transport.py       SSE POST + key-file fallback (stdlib only)
 │   ├── echo.py            Offline EchoProvider
-│   ├── anthropic.py       AnthropicProvider (Messages API SSE)
-│   └── openai.py          OpenAIProvider (chat/completions SSE)
+│   ├── anthropic.py       AnthropicProvider (Messages API SSE + tool_use)
+│   └── openai.py          OpenAIProvider (chat/completions SSE + tool_calls)
+├── tools/
+│   ├── __init__.py        Bundles the default tool set into a registry
+│   ├── _common.py         Shared helpers (lazy-bpy, vec3 coercion, JSON)
+│   ├── scene.py           list_objects / get_object / select
+│   ├── mesh.py            add_primitive
+│   ├── transform.py       translate / rotate / scale
+│   ├── system.py          bpy.run_operator (allowlisted) + python.eval_in_sandbox
+│   └── viewport.py        screenshot to a temp PNG path
 └── README.md              this file
 ```
 
