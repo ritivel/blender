@@ -11,6 +11,7 @@ real worker thread or scheduling timers.
 """
 
 import importlib.util
+import queue
 import sys
 import threading
 import types
@@ -256,6 +257,56 @@ class HardStopTest(unittest.TestCase):
         ok = operators._start_next_step(state, session)
         self.assertFalse(ok)
         self.assertIn("hard-stop", session.messages[-1].content)
+
+
+class DrainTickTest(unittest.TestCase):
+    def tearDown(self):
+        operators._state = None
+
+    def test_finish_reason_survives_until_worker_sentinel_arrives(self):
+        invocations = []
+
+        def _record(args):
+            invocations.append(args)
+            return "ok"
+
+        tool = harness.ToolSpec(
+            name="scene.list_objects", description="d", permission="read",
+            parameters={"type": "object"}, run=_record,
+        )
+        call = harness.ToolCall(
+            id="tc_1", name="scene.list_objects", arguments={"filter": "mesh"},
+        )
+
+        session = _make_session()
+        session.busy = True
+        operators._append_message(session, "user", "inspect scene")
+        idx = operators._append_message(session, "assistant", "")
+        scene = _Scene(session)
+        q = queue.Queue()
+        state = operators._RequestState(
+            thread=None, q=q, cancel=threading.Event(), scene=scene,
+            msg_index=idx, history=[harness.Message(role="user", content="inspect scene")],
+            tools=[tool], provider=FakeProvider([]),
+        )
+        state.step = operators._MAX_AGENT_STEPS
+        operators._state = state
+
+        q.put(harness.StreamChunk(tool_call=call))
+        q.put(harness.StreamChunk(finish_reason="tool_use"))
+
+        self.assertEqual(operators._drain_tick(), operators._TICK_INTERVAL)
+        self.assertEqual(state.finish_reason, "tool_use")
+        self.assertEqual(invocations, [])
+
+        q.put(None)
+        self.assertIsNone(operators._drain_tick())
+
+        self.assertEqual(invocations, [{"filter": "mesh"}])
+        self.assertIsNone(operators._state)
+        self.assertFalse(session.busy)
+        self.assertEqual(state.history[-2].tool_calls[0].id, "tc_1")
+        self.assertEqual(state.history[-1].tool_results[0].content, "ok")
 
 
 class BuildHistoryWithToolsTest(unittest.TestCase):

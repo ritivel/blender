@@ -58,6 +58,7 @@ class _RequestState:
     __slots__ = (
         "thread", "queue", "cancel", "scene_ref", "msg_index",
         "history", "tools", "provider", "step", "pending_tool_calls",
+        "finish_reason",
     )
 
     def __init__(self, thread, q, cancel, scene, msg_index, history, tools, provider):
@@ -71,6 +72,7 @@ class _RequestState:
         self.provider = provider
         self.step = 0
         self.pending_tool_calls: list[harness.ToolCall] = []
+        self.finish_reason: str | None = None
 
 
 _state: _RequestState | None = None
@@ -238,6 +240,7 @@ def _start_next_step(state: _RequestState, session) -> bool:
 
     state.queue = queue.Queue()
     state.cancel.clear()
+    state.finish_reason = None
     state.thread = threading.Thread(
         target=_worker,
         args=(state.provider, state.history, state.tools, state.queue, state.cancel),
@@ -284,7 +287,6 @@ def _drain_tick():
 
     finished = False
     error: str | None = None
-    finish_reason: str | None = None
     while True:
         try:
             chunk = state.queue.get_nowait()
@@ -302,7 +304,7 @@ def _drain_tick():
         if chunk.tool_call is not None:
             state.pending_tool_calls.append(chunk.tool_call)
         if chunk.finish_reason:
-            finish_reason = chunk.finish_reason
+            state.finish_reason = chunk.finish_reason
 
     _redraw_view3d()
 
@@ -315,7 +317,7 @@ def _drain_tick():
         _state = None
         return None
 
-    if finish_reason == "tool_use" and state.pending_tool_calls and not state.cancel.is_set():
+    if state.finish_reason == "tool_use" and state.pending_tool_calls and not state.cancel.is_set():
         _run_pending_tools(state, session)
         if not _start_next_step(state, session):
             _finalise(state, session, None)
