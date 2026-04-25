@@ -66,16 +66,31 @@ def _append_message(session, role: str, content: str) -> int:
     return session.active_message_index
 
 
+def _append_history_message(
+    history: list[harness.Message],
+    role: str,
+    content: str,
+) -> None:
+    if history and history[-1].role == role:
+        history[-1].content += "\n\n" + content
+    else:
+        history.append(harness.Message(role=role, content=content))
+
+
 def _build_history(session, system_prompt: str) -> list[harness.Message]:
-    history: list[harness.Message] = []
+    system_messages: list[harness.Message] = []
+    turns: list[harness.Message] = []
     if system_prompt:
-        history.append(harness.Message(role="system", content=system_prompt))
+        _append_history_message(system_messages, "system", system_prompt)
     for m in session.messages:
-        if not m.content:
+        if not m.content or not m.content.strip():
             # Skip the empty placeholder we appended for streaming.
             continue
-        history.append(harness.Message(role=m.role, content=m.content))
-    return history
+        if m.role == "system":
+            _append_history_message(system_messages, "system", m.content)
+        elif m.role in {"user", "assistant"}:
+            _append_history_message(turns, m.role, m.content)
+    return system_messages + turns
 
 
 def _worker(provider, history, tools, q: queue.Queue, cancel: threading.Event):
