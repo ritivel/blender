@@ -74,6 +74,7 @@ def _screenshot(args: dict) -> str:
 
     res_x = args.get("resolution_x")
     res_y = args.get("resolution_y")
+    output_resolution = [render.resolution_x, render.resolution_y]
     try:
         render.image_settings.file_format = "PNG"
         render.filepath = out_path
@@ -81,6 +82,7 @@ def _screenshot(args: dict) -> str:
             render.resolution_x = int(res_x)
         if res_y is not None:
             render.resolution_y = int(res_y)
+        output_resolution = [render.resolution_x, render.resolution_y]
         bpy.ops.render.opengl(write_still=True)
     finally:
         render.filepath = saved["filepath"]
@@ -97,7 +99,7 @@ def _screenshot(args: dict) -> str:
     return _common.to_json({
         "path": out_path,
         "size_bytes": size,
-        "resolution": [render.resolution_x, render.resolution_y],
+        "resolution": output_resolution,
     })
 
 

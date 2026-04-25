@@ -278,6 +278,50 @@ class SystemToolsTest(unittest.TestCase):
         self.assertEqual(out["result"], 10)
 
 
+class ViewportToolsTest(unittest.TestCase):
+    def test_screenshot_reports_override_resolution_and_restores_scene(self):
+        render = types.SimpleNamespace(
+            filepath="/tmp/original.png",
+            image_settings=types.SimpleNamespace(file_format="JPEG"),
+            resolution_x=640,
+            resolution_y=480,
+        )
+        calls = []
+
+        def opengl(**kwargs):
+            calls.append((
+                kwargs,
+                render.filepath,
+                render.image_settings.file_format,
+                render.resolution_x,
+                render.resolution_y,
+            ))
+
+        bpy = _install_bpy_stub(ops=types.SimpleNamespace(
+            render=types.SimpleNamespace(opengl=opengl),
+        ))
+        bpy.context.scene.render = render
+
+        registry, _h, _t = _bootstrap()
+        out = json.loads(registry.get("viewport.screenshot").run({
+            "resolution_x": 320,
+            "resolution_y": 240,
+        }))
+
+        self.assertEqual(out["resolution"], [320, 240])
+        self.assertEqual(calls, [(
+            {"write_still": True},
+            out["path"],
+            "PNG",
+            320,
+            240,
+        )])
+        self.assertEqual(render.filepath, "/tmp/original.png")
+        self.assertEqual(render.image_settings.file_format, "JPEG")
+        self.assertEqual(render.resolution_x, 640)
+        self.assertEqual(render.resolution_y, 480)
+
+
 class DefaultToolSetTest(unittest.TestCase):
     def test_register_default_tools_registers_full_tool_set(self):
         _install_bpy_stub()
