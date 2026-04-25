@@ -29,7 +29,8 @@ from bpy.types import PropertyGroup
 CHAT_ROLES = (
     ("user", "User", "Message authored by the human"),
     ("assistant", "Assistant", "Message authored by the AI"),
-    ("system", "System", "System or tool message"),
+    ("system", "System", "System message (errors, status notes)"),
+    ("tool", "Tool", "Tool invocation log entry written by the agent loop"),
 )
 
 

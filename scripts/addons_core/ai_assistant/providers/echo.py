@@ -44,3 +44,4 @@ class EchoProvider:
         # Stream word-by-word so the UI exercises the same code path as a real provider.
         for token in text.split(" "):
             yield harness.StreamChunk(delta_text=token + " ")
+        yield harness.StreamChunk(finish_reason="stop")

@@ -11,9 +11,10 @@ assistant, and have the assistant safely drive Blender via tools (bpy
 operators, scene introspection, geometry nodes, generated Python) under a
 permission model the user controls**.
 
-**Status:** Step 1 (scaffold) and Step 2 (real streaming providers) are
-implemented. Subsequent steps are intentionally deferred so each lands
-as a small, reviewable change.
+**Status:** Steps 1 (scaffold), 2 (real streaming providers), and 3
+(typed tool harness with the first tool set) are implemented.
+Subsequent steps are intentionally deferred so each lands as a small,
+reviewable change.
 
 ---
 
@@ -129,20 +130,50 @@ OpenAI streams assemble correctly end-to-end, HTTP errors surface as
 chunked errors, and the missing-key path falls back to `EchoProvider`
 with a configuration hint.
 
-### Step 3 — Tool harness ("Atelier")
+### Step 3 — Tool harness ("Atelier") *(landed)*
 
-Define the typed tool interface (name, JSON-schema params, permission
-class, callable). Ship the first tool set:
+The harness now defines a typed tool interface (`name`, JSON-schema
+`parameters`, `permission` class, `run` callable) and ships the first
+tool set under `scripts/addons_core/ai_assistant/tools/`:
 
 - `scene.list_objects`, `scene.get_object`, `scene.select`
 - `mesh.add_primitive`, `transform.translate/rotate/scale`
-- `bpy.run_operator` (gated, allowlisted)
-- `python.eval_in_sandbox` (gated)
-- `viewport.screenshot` for the model to "see"
+- `bpy.run_operator` (gated, allowlisted to a fixed namespace set —
+  no `wm.*`, no `preferences.*`, no add-on installation)
+- `python.eval_in_sandbox` (gated, restricted namespace: only
+  curated builtins, only `bpy.data` and `bpy.context` access, no
+  imports, no dunders)
+- `viewport.screenshot` so the model can "see" — writes a PNG to a
+  fresh path under `tempfile.gettempdir()`
 
-Wire the agent loop to call tools, append tool results to the
-conversation, and loop until the model emits a final answer or a
-hard-stop is reached.
+The send operator now drives a *multi-step* agent loop:
+
+1. Worker thread streams provider output (text deltas + tool-call
+   chunks) onto a queue.
+2. A `bpy.app.timers` callback drains the queue on the main thread.
+3. When the provider emits ``finish_reason == "tool_use"``, the timer
+   executes each pending tool **on the main thread** (so it can
+   safely touch `bpy.data` / `bpy.context`), appends a tool log
+   entry to the chat, and spawns a fresh worker that resumes the
+   conversation with the tool results.
+4. Loop until the model emits ``finish_reason == "stop"`` or the
+   per-turn step cap is reached.
+
+Permission gating is provisional: this step honours `deny` (no tools
+exposed), `always` (all tools), and treats `ask` / `session` as
+*read-only* (only tools with `permission == "read"` are forwarded to
+the model). The full modal popup arrives in step 4.
+
+Both providers were extended:
+
+* **Anthropic** — declares `tools` in the request body, parses
+  `content_block_start`/`input_json_delta`/`content_block_stop` for
+  tool-use blocks, and round-trips `tool_use` + `tool_result` content
+  blocks across turns.
+* **OpenAI / OpenAI-compatible** — declares OpenAI-style
+  `function`-typed tools, assembles streamed `tool_calls[].function.arguments`
+  fragments, emits one `StreamChunk` per call, and round-trips
+  `tool_calls` / `role: "tool"` messages.
 
 ### Step 4 — Permission model
 

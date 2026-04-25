@@ -21,6 +21,29 @@ _ROLE_ICONS = {
 }
 
 
+_QUICK_PROMPTS = (
+    ("Describe the current scene", "Describe the current scene briefly."),
+    (
+        "Explain selected object",
+        "Explain what the selected object is and how it is configured.",
+    ),
+    (
+        "Suggest cleanups",
+        "Suggest cleanups for unused materials, orphan data, and naming issues.",
+    ),
+    (
+        "Add a cube here",
+        "Use the mesh.add_primitive tool to add a cube at the world origin and "
+        "name it 'AI_Cube'.",
+    ),
+    (
+        "Count meshes",
+        "Use scene.list_objects (and python.eval_in_sandbox if it is enabled) "
+        "to tell me how many MESH objects are in the current scene.",
+    ),
+)
+
+
 class AI_ASSISTANT_UL_messages(UIList):
     def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
         icon_id = _ROLE_ICONS.get(item.role, "DOT")
@@ -84,15 +107,9 @@ class VIEW3D_PT_ai_assistant_quickprompts(Panel):
     bl_parent_id = "VIEW3D_PT_ai_assistant"
     bl_options = {"DEFAULT_CLOSED"}
 
-    _PROMPTS = (
-        ("Describe the current scene", "Describe the current scene briefly."),
-        ("Explain selected object", "Explain what the selected object is and how it is configured."),
-        ("Suggest cleanups", "Suggest cleanups for unused materials, orphan data, and naming issues."),
-    )
-
     def draw(self, context):
         layout = self.layout
-        for label, prompt in self._PROMPTS:
+        for label, prompt in _QUICK_PROMPTS:
             op = layout.operator("ai_assistant.set_draft", text=label, icon="GREASEPENCIL")
             op.text = prompt
 

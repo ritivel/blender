@@ -4,10 +4,9 @@
 
 """Add-on preferences for the AI Assistant.
 
-Provider configuration is intentionally kept lightweight in step 1: the
-real network clients land in step 2. The fields defined here cover the
-shape we need so users can configure the add-on once and not have to
-revisit preferences when later steps activate the real providers.
+Holds provider configuration (shared across scenes) and the global tool
+permission mode used by the agent loop. Per-scene chat state lives in
+:mod:`properties` instead.
 """
 
 import bpy
@@ -16,10 +15,10 @@ from bpy.types import AddonPreferences
 
 
 PROVIDERS = (
-    ("echo", "Echo (offline)", "Local stub provider used by step 1; replies with a canned message"),
-    ("anthropic", "Anthropic", "Claude models via api.anthropic.com (requires step 2)"),
-    ("openai", "OpenAI", "GPT models via api.openai.com (requires step 2)"),
-    ("custom", "OpenAI-compatible", "Self-hosted or third-party OpenAI-compatible endpoint (requires step 2)"),
+    ("echo", "Echo (offline)", "Local stub provider; streams a canned reply with a configuration hint"),
+    ("anthropic", "Anthropic", "Claude models via api.anthropic.com"),
+    ("openai", "OpenAI", "GPT models via api.openai.com"),
+    ("custom", "OpenAI-compatible", "Self-hosted or third-party OpenAI-compatible endpoint"),
 )
 
 
@@ -34,8 +33,14 @@ PERMISSION_MODES = (
 DEFAULT_SYSTEM_PROMPT = (
     "You are an AI assistant embedded inside Blender, a 3D creation suite. "
     "You help the user model, animate, render, and script. Prefer concise "
-    "answers. When making scene changes, describe the change first; tool "
-    "execution is gated by the user's permission settings."
+    "answers. You have access to scene introspection tools "
+    "(scene.list_objects, scene.get_object), mutation tools "
+    "(mesh.add_primitive, transform.translate/rotate/scale, scene.select), "
+    "and gated escape hatches (bpy.run_operator, python.eval_in_sandbox, "
+    "viewport.screenshot). Prefer the structured tools over raw operator "
+    "or Python eval; reach for those only when the structured surface is "
+    "insufficient. Always describe the change you intend to make before "
+    "calling a mutating tool."
 )
 
 
