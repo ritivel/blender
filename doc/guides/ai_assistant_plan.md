@@ -11,8 +11,9 @@ assistant, and have the assistant safely drive Blender via tools (bpy
 operators, scene introspection, geometry nodes, generated Python) under a
 permission model the user controls**.
 
-**Status:** Steps 1 (scaffold), 2 (real streaming providers), and 3
-(typed tool harness with the first tool set) are implemented.
+**Status:** Steps 1 (scaffold), 2 (real streaming providers), 3
+(typed tool harness with the first tool set), and 4 (per-call
+permission gate with session and per-project trust) are implemented.
 Subsequent steps are intentionally deferred so each lands as a small,
 reviewable change.
 
@@ -175,12 +176,43 @@ Both providers were extended:
   fragments, emits one `StreamChunk` per call, and round-trips
   `tool_calls` / `role: "tool"` messages.
 
-### Step 4 — Permission model
+### Step 4 — Permission model *(landed)*
 
-Per-tool permission classes: `read`, `write`, `exec`. Modes:
-`ask-each-time`, `allow-for-session`, `allow-always`, `deny`. Modal
-permission popup matches Claude Code's tool-call gate. Per-project
-"trusted scopes" stored alongside the .blend file.
+Per-tool permission classes: `read`, `write`, `exec` (declared by
+:class:`ToolSpec`). Global modes from the add-on preferences:
+`ask-each-time`, `allow-for-session`, `allow-always`, `deny`.
+
+The agent loop now consults a per-call gate
+(:func:`permissions.decide`) before running every non-`read` tool
+call:
+
+* `deny` short-circuits to a denial result without running the tool.
+* `read` tools auto-allow (introspection has no side effects).
+* `always` mode auto-allows write/exec calls.
+* Otherwise, the modal :class:`AI_ASSISTANT_OT_permission_prompt`
+  popup is invoked. It mirrors Claude Code's four-option confirm:
+  *Allow once*, *Allow for this session*, *Always for this project*,
+  *Deny*.
+
+Trust state lives in two places:
+
+* **Session trust** — a process-local set in :mod:`permissions`,
+  cleared on add-on reload. Surfaced in the add-on Preferences with
+  one-click revoke per entry.
+* **Project trust** — persisted on
+  ``Scene.ai_assistant.trusted_tools`` so it survives a Blender
+  restart with the .blend file. Surfaced in the new "Trusted Tools"
+  sub-panel under the AI sidebar with one-click revoke.
+
+Tool calls that are denied (by mode or by user) still flow back to
+the model as `ToolResult(is_error=True)` with a message that asks
+the model not to retry the same call. Pressing **Stop** while a
+permission popup is open also resolves it as a denial so the loop
+can unwind cleanly.
+
+The full tool catalogue is now advertised to the model in any non-
+`deny` mode: the model sees what is possible up-front and the user
+controls what actually runs at execution time.
 
 ### Step 5 — Background / parallel agents
 

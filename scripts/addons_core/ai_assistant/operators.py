@@ -4,23 +4,30 @@
 
 """Operators backing the AI Assistant chat UI.
 
-Step 3 promotes the previously single-shot send into a full agent loop:
+Step 4 promotes the agent loop into a per-call permission gate:
 
-1. The send operator builds the initial conversation, picks an
-   in-memory placeholder assistant message, and starts a worker thread
-   that streams from the provider.
-2. The worker thread *only* speaks HTTP — it never touches ``bpy``
-   data. Text deltas and tool-call requests are pushed onto a queue.
+1. The send operator builds the initial conversation, picks an in-memory
+   placeholder assistant message, and starts a worker thread that
+   streams from the provider.
+2. The worker thread *only* speaks HTTP — it never touches ``bpy`` data.
+   Text deltas and tool-call requests are pushed onto a queue.
 3. A timer callback (:func:`_drain_tick`) drains the queue on the main
    thread, appends text deltas to the chat, and accumulates pending
    tool calls.
-4. When the worker emits a ``finish_reason``:
-   * ``stop`` — turn is complete; tear down state.
-   * ``tool_use`` — execute each pending tool call on the main thread,
-     append a tool log entry to the chat, append the tool result to the
-     in-memory history, and spawn a fresh worker for the next round.
-   A hard cap (:data:`_MAX_AGENT_STEPS`) bounds the loop so a model
-   that never produces a final answer cannot wedge the UI.
+4. When the worker emits ``finish_reason == "tool_use"`` the timer
+   walks the pending calls **one at a time**:
+
+   * Each call is resolved through :func:`permissions.decide`.
+   * ``ALLOW`` runs the tool right away.
+   * ``DENY`` records a denial tool result and continues.
+   * ``PROMPT`` invokes the modal :class:`AI_ASSISTANT_OT_permission_prompt`
+     popup. The tick *pauses* until the popup writes its decision back
+     into the request state and the timer re-fires.
+
+5. Once every pending call has been resolved (or the cancel event fires)
+   a fresh worker is spawned for the next round. A hard cap
+   (:data:`_MAX_AGENT_STEPS`) bounds the loop so a model that never
+   produces a final answer cannot wedge the UI.
 
 Tool execution runs on the main thread so it can safely touch
 ``bpy.data`` and ``bpy.context``. The cancel event can interrupt the
@@ -35,10 +42,11 @@ import threading
 import weakref
 
 import bpy
-from bpy.props import StringProperty
+from bpy.props import EnumProperty, IntProperty, StringProperty
 from bpy.types import Operator
 
 from . import harness
+from . import permissions
 from .preferences import get_prefs
 
 
@@ -53,15 +61,20 @@ _MAX_AGENT_STEPS = 12
 # Cap on how much of a tool result we render into the visible chat log.
 _TOOL_LOG_PREVIEW = 240
 
+# Cap on the prompt body shown inside the modal popup. Long arg blobs
+# overflow Blender's popup width, so we truncate aggressively.
+_PROMPT_ARG_PREVIEW = 200
+
 
 class _RequestState:
     __slots__ = (
         "thread", "queue", "cancel", "scene_ref", "msg_index",
         "history", "tools", "provider", "step", "pending_tool_calls",
-        "finish_reason",
+        "round_tool_calls", "finish_reason", "tool_results",
+        "permission_mode", "awaiting_decision", "pending_decision",
     )
 
-    def __init__(self, thread, q, cancel, scene, msg_index, history, tools, provider):
+    def __init__(self, thread, q, cancel, scene, msg_index, history, tools, provider, permission_mode):
         self.thread = thread
         self.queue = q
         self.cancel = cancel
@@ -72,7 +85,19 @@ class _RequestState:
         self.provider = provider
         self.step = 0
         self.pending_tool_calls: list[harness.ToolCall] = []
+        # Snapshot of every ToolCall the model requested in the current
+        # round, kept around for `_commit_tool_round`. Cleared at the
+        # start of each new tool-use round.
+        self.round_tool_calls: list[harness.ToolCall] = []
         self.finish_reason: str | None = None
+        # Tool results accumulated for the current tool-use round.
+        self.tool_results: list[harness.ToolResult] = []
+        self.permission_mode: str = permission_mode
+        # ``awaiting_decision`` is the ToolCall currently shown in a
+        # modal popup. The tick stops processing tool calls until the
+        # popup writes a value to ``pending_decision``.
+        self.awaiting_decision: harness.ToolCall | None = None
+        self.pending_decision: str | None = None
 
 
 _state: _RequestState | None = None
@@ -174,52 +199,155 @@ def _execute_tool(tool: harness.ToolSpec, arguments: dict) -> harness.ToolResult
     return harness.ToolResult(call_id="", content=result_text, is_error=False)
 
 
-def _run_pending_tools(state: _RequestState, session) -> None:
-    """Execute pending tool calls and update history + chat session."""
-    tool_results: list[harness.ToolResult] = []
+def _record_tool_outcome(
+    state: _RequestState,
+    session,
+    call: harness.ToolCall,
+    result: harness.ToolResult,
+    log_prefix: str,
+) -> None:
+    """Append a chat log line and stash the result on ``state``."""
+    log = "{} {}({}) → {}".format(
+        log_prefix, call.name, _summarise_args(call.arguments),
+        _summarise_result(result.content),
+    )
+    _append_message(session, "tool", log)
+    result.call_id = call.id
+    state.tool_results.append(result)
+
+
+def _process_pending_tools(state: _RequestState, session) -> bool:
+    """Walk pending tool calls until the queue empties or a popup pauses us.
+
+    Returns ``True`` when every call for the current round has been
+    resolved (so the caller can spawn the next provider step), ``False``
+    when we stopped to wait for a modal decision.
+    """
     by_name = {t.name: t for t in state.tools}
 
-    for call in state.pending_tool_calls:
+    while state.pending_tool_calls:
         if state.cancel.is_set():
+            # Treat any remaining calls as silent denials so the model
+            # does not see partial state on the next round.
+            for call in state.pending_tool_calls:
+                _record_tool_outcome(
+                    state, session, call,
+                    harness.ToolResult(
+                        call_id="", content="cancelled", is_error=True,
+                    ),
+                    "[tool] cancelled",
+                )
+            state.pending_tool_calls.clear()
             break
+
+        call = state.pending_tool_calls[0]
         tool = by_name.get(call.name)
+
         if tool is None:
-            log = "[tool] {}({}) → unknown or denied".format(
-                call.name, _summarise_args(call.arguments),
+            _record_tool_outcome(
+                state, session, call,
+                harness.ToolResult(
+                    call_id="",
+                    content="Unknown or denied tool: {}".format(call.name),
+                    is_error=True,
+                ),
+                "[tool] denied",
             )
-            _append_message(session, "tool", log)
-            tool_results.append(harness.ToolResult(
-                call_id=call.id,
-                content="Unknown or denied tool: {}".format(call.name),
-                is_error=True,
-            ))
+            state.pending_tool_calls.pop(0)
             continue
 
-        result = _execute_tool(tool, call.arguments)
-        result.call_id = call.id
-        log = "[tool] {}({}) → {}".format(
-            call.name, _summarise_args(call.arguments), _summarise_result(result.content),
+        scene = state.scene_ref()
+        gate = permissions.decide(
+            state.permission_mode, scene, tool.name, tool.permission,
         )
-        _append_message(session, "tool", log)
-        tool_results.append(result)
 
-    # Record the assistant turn (with tool calls) and the tool results in
-    # the in-memory history so the next provider call sees them.
+        if gate == permissions.DENY:
+            _record_tool_outcome(
+                state, session, call,
+                harness.ToolResult(
+                    call_id="",
+                    content=permissions.denial_message(
+                        tool.name, state.permission_mode,
+                    ),
+                    is_error=True,
+                ),
+                "[tool] denied",
+            )
+            state.pending_tool_calls.pop(0)
+            continue
+
+        if gate == permissions.PROMPT:
+            if state.awaiting_decision is None:
+                state.awaiting_decision = call
+                state.pending_decision = None
+                _invoke_permission_popup(call, tool)
+                return False
+            if state.pending_decision is None:
+                # Popup still open; come back next tick.
+                return False
+            decision = state.pending_decision
+            state.pending_decision = None
+            state.awaiting_decision = None
+            outcome = permissions.apply_decision(scene, tool.name, decision)
+            if outcome == permissions.DENY:
+                _record_tool_outcome(
+                    state, session, call,
+                    harness.ToolResult(
+                        call_id="",
+                        content=permissions.denial_message(
+                            tool.name, state.permission_mode,
+                        ),
+                        is_error=True,
+                    ),
+                    "[tool] denied",
+                )
+                state.pending_tool_calls.pop(0)
+                continue
+            # Allowed — fall through to execution below.
+
+        result = _execute_tool(tool, call.arguments)
+        log_prefix = "[tool] error" if result.is_error else "[tool]"
+        _record_tool_outcome(state, session, call, result, log_prefix)
+        state.pending_tool_calls.pop(0)
+
+    return state.awaiting_decision is None
+
+
+def _commit_tool_round(state: _RequestState, session) -> None:
+    """Append the assistant + tool messages to the provider history."""
     placeholder_idx = state.msg_index
     if 0 <= placeholder_idx < len(session.messages):
         assistant_text = session.messages[placeholder_idx].content
     else:
         assistant_text = ""
+    # Replay the original calls (denied or otherwise) so the assistant
+    # turn matches what the provider asked for; the ordering matches
+    # ``tool_results`` because we drained them in request order.
     state.history.append(harness.Message(
         role="assistant",
         content=assistant_text,
-        tool_calls=list(state.pending_tool_calls),
+        tool_calls=list(state.round_tool_calls),
     ))
     state.history.append(harness.Message(
         role="tool",
-        tool_results=tool_results,
+        tool_results=list(state.tool_results),
     ))
-    state.pending_tool_calls = []
+    state.tool_results = []
+    state.round_tool_calls = []
+
+
+def _invoke_permission_popup(call: harness.ToolCall, tool: harness.ToolSpec) -> None:
+    """Show the modal permission popup for one tool call."""
+    args_preview = _summarise_args(call.arguments)
+    if len(args_preview) > _PROMPT_ARG_PREVIEW:
+        args_preview = args_preview[: _PROMPT_ARG_PREVIEW - 1] + "…"
+    bpy.ops.ai_assistant.permission_prompt(
+        "INVOKE_DEFAULT",
+        tool_name=call.name,
+        tool_permission=tool.permission,
+        tool_description=tool.description,
+        arguments_preview=args_preview,
+    )
 
 
 def _start_next_step(state: _RequestState, session) -> bool:
@@ -285,6 +413,30 @@ def _drain_tick():
         _state = None
         return None
 
+    # If the user pressed Stop while a permission popup is open, the
+    # cancel event is set but we'd otherwise be stuck waiting for a
+    # decision. Treat the in-flight popup as a denial so the loop can
+    # unwind cleanly.
+    if state.cancel.is_set() and state.awaiting_decision is not None and state.pending_decision is None:
+        state.pending_decision = permissions.DECISION_DENY
+
+    # If we are in the middle of a tool-use round (awaiting a popup
+    # decision or still walking the pending-call queue), pick up where
+    # we left off before reading more from the queue. The provider
+    # stream has already finished for this step in that case.
+    if state.awaiting_decision is not None or state.pending_tool_calls:
+        if not state.round_tool_calls:
+            state.round_tool_calls = list(state.pending_tool_calls)
+        if not _process_pending_tools(state, session):
+            _redraw_view3d()
+            return _TICK_INTERVAL
+        _commit_tool_round(state, session)
+        if not _start_next_step(state, session):
+            _finalise(state, session, None)
+            _state = None
+            return None
+        return _TICK_INTERVAL
+
     finished = False
     error: str | None = None
     while True:
@@ -318,7 +470,10 @@ def _drain_tick():
         return None
 
     if state.finish_reason == "tool_use" and state.pending_tool_calls and not state.cancel.is_set():
-        _run_pending_tools(state, session)
+        state.round_tool_calls = list(state.pending_tool_calls)
+        if not _process_pending_tools(state, session):
+            return _TICK_INTERVAL
+        _commit_tool_round(state, session)
         if not _start_next_step(state, session):
             _finalise(state, session, None)
             _state = None
@@ -360,6 +515,7 @@ class AI_ASSISTANT_OT_send(Operator):
         session = context.scene.ai_assistant
         prefs = get_prefs(context)
         system_prompt = prefs.system_prompt if prefs else ""
+        permission_mode = getattr(prefs, "permission_mode", "ask") if prefs else "ask"
 
         user_text = session.draft.strip()
         session.draft = ""
@@ -385,6 +541,7 @@ class AI_ASSISTANT_OT_send(Operator):
         _state = _RequestState(
             thread=thread, q=q, cancel=cancel, scene=context.scene,
             msg_index=msg_index, history=history, tools=tools, provider=provider,
+            permission_mode=permission_mode,
         )
         _state.step = 1
         thread.start()
@@ -445,11 +602,107 @@ class AI_ASSISTANT_OT_set_draft(Operator):
         return {"FINISHED"}
 
 
+_DECISION_ITEMS = (
+    (permissions.DECISION_ONCE, "Allow once",
+     "Run this tool call now; ask again next time"),
+    (permissions.DECISION_SESSION, "Allow for this session",
+     "Trust this tool until Blender is restarted"),
+    (permissions.DECISION_ALWAYS, "Always for this project",
+     "Trust this tool for the lifetime of this .blend file"),
+    (permissions.DECISION_DENY, "Deny",
+     "Block this call and tell the assistant to back off"),
+)
+
+
+class AI_ASSISTANT_OT_permission_prompt(Operator):
+    """Ask the user to confirm a single AI tool call.
+
+    Step 4 of the AI Assistant plan: this is the per-call gate that
+    sits between the agent loop and tool execution. It mirrors the
+    four-option confirmation popup in Claude Code (allow once /
+    session / always / deny). The decision is written back to the
+    in-flight request state so the agent loop can resume from the
+    next tick.
+    """
+    bl_idname = "ai_assistant.permission_prompt"
+    bl_label = "AI Assistant — Confirm Tool"
+    bl_options = {"INTERNAL"}
+
+    tool_name: StringProperty(default="")
+    tool_permission: StringProperty(default="write")
+    tool_description: StringProperty(default="")
+    arguments_preview: StringProperty(default="")
+    decision: EnumProperty(
+        name="Decision",
+        items=_DECISION_ITEMS,
+        default=permissions.DECISION_ONCE,
+    )
+
+    def invoke(self, context, _event):
+        return context.window_manager.invoke_props_dialog(self, width=460)
+
+    def draw(self, context):
+        layout = self.layout
+        layout.label(
+            text="The assistant wants to run a {} tool:".format(
+                self.tool_permission,
+            ),
+            icon="QUESTION",
+        )
+        box = layout.box()
+        box.label(text=self.tool_name, icon="TOOL_SETTINGS")
+        if self.tool_description:
+            for line in self.tool_description.splitlines():
+                box.label(text=line)
+        if self.arguments_preview:
+            layout.label(text="Arguments:")
+            args_box = layout.box()
+            args_box.label(text=self.arguments_preview)
+        layout.separator()
+        layout.prop(self, "decision", expand=False)
+
+    def execute(self, _context):
+        if _state is not None:
+            _state.pending_decision = self.decision
+        return {"FINISHED"}
+
+    def cancel(self, _context):
+        if _state is not None:
+            _state.pending_decision = permissions.DECISION_DENY
+
+
+class AI_ASSISTANT_OT_revoke_trust(Operator):
+    """Revoke per-session or per-project trust for a tool"""
+    bl_idname = "ai_assistant.revoke_trust"
+    bl_label = "Revoke Trust"
+    bl_options = {"INTERNAL"}
+
+    scope: EnumProperty(
+        items=(
+            ("session", "Session", "Process-local trust"),
+            ("project", "Project", "Trust persisted in the .blend file"),
+        ),
+        default="session",
+    )
+    tool_name: StringProperty(default="")
+
+    def execute(self, context):
+        if not self.tool_name:
+            return {"CANCELLED"}
+        if self.scope == "session":
+            permissions.revoke_session_trust(self.tool_name)
+        else:
+            permissions.revoke_project_trust(context.scene, self.tool_name)
+        return {"FINISHED"}
+
+
 _classes = (
     AI_ASSISTANT_OT_send,
     AI_ASSISTANT_OT_stop,
     AI_ASSISTANT_OT_clear,
     AI_ASSISTANT_OT_set_draft,
+    AI_ASSISTANT_OT_permission_prompt,
+    AI_ASSISTANT_OT_revoke_trust,
 )
 
 
@@ -465,5 +718,6 @@ def unregister():
         _state = None
     if bpy.app.timers.is_registered(_drain_tick):
         bpy.app.timers.unregister(_drain_tick)
+    permissions.clear_session()
     for cls in reversed(_classes):
         bpy.utils.unregister_class(cls)

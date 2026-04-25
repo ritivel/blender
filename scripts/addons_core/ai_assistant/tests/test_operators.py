@@ -17,6 +17,8 @@ def _install_bpy_stub() -> None:
     bpy = types.ModuleType("bpy")
     bpy_props = types.ModuleType("bpy.props")
     bpy_props.StringProperty = lambda **_kwargs: None
+    bpy_props.EnumProperty = lambda **_kwargs: None
+    bpy_props.IntProperty = lambda **_kwargs: None
     bpy_types = types.ModuleType("bpy.types")
     bpy_types.Operator = object
     bpy.props = bpy_props
@@ -28,6 +30,11 @@ def _install_bpy_stub() -> None:
             register=lambda _callback, first_interval=0.0: None,
             unregister=lambda _callback: None,
         )
+    )
+    bpy.ops = types.SimpleNamespace(
+        ai_assistant=types.SimpleNamespace(
+            permission_prompt=lambda *args, **kwargs: None,
+        ),
     )
     sys.modules["bpy"] = bpy
     sys.modules["bpy.props"] = bpy_props
@@ -50,6 +57,7 @@ def _load_operators_module():
 
     _install_bpy_stub()
     _load_module(PACKAGE_NAME + ".harness", ADDON_DIR / "harness.py")
+    _load_module(PACKAGE_NAME + ".permissions", ADDON_DIR / "permissions.py")
 
     preferences = types.ModuleType(PACKAGE_NAME + ".preferences")
     preferences.get_prefs = lambda _context: None
