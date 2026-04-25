@@ -23,7 +23,7 @@ has set the global permission mode to "Always allow".
 
 from __future__ import annotations
 
-import json
+from collections.abc import Mapping
 
 from .. import harness
 from . import _common
@@ -123,11 +123,14 @@ def _run_operator(args: dict) -> str:
     return _common.to_json({"operator": op_id, "result": result_list})
 
 
-# Curated read-mostly subset of the bpy API exposed to the sandbox.
+# Curated read-only subset of the bpy API exposed to the sandbox.
 # ``bpy.data`` and ``bpy.context`` are useful for "count meshes", "sum
 # polygons", "describe selection", etc. We deliberately omit ``bpy.ops``
 # (use ``bpy.run_operator`` with allowlist) and ``bpy.app`` (handlers,
-# timers — too easy to wedge Blender from a one-liner).
+# timers — too easy to wedge Blender from a one-liner). Values reachable
+# through ``bpy.data`` and ``bpy.context`` are wrapped so expressions can
+# traverse attributes, indexes, and collections without calling live Blender
+# methods such as ``remove()``, ``new()``, ``select_set()``, or file writers.
 def _build_sandbox_globals() -> dict:
     import bpy
 
@@ -148,7 +151,7 @@ def _build_sandbox_globals() -> dict:
 
 
 class _SafeBpy:
-    """Minimal proxy exposing only ``data`` and ``context`` of ``bpy``."""
+    """Minimal proxy exposing read-only ``data`` and ``context`` of ``bpy``."""
 
     __slots__ = ("_bpy",)
 
@@ -157,20 +160,139 @@ class _SafeBpy:
 
     @property
     def data(self):
-        return self._bpy.data
+        return _sandbox_readonly(self._bpy.data)
 
     @property
     def context(self):
-        return self._bpy.context
+        return _sandbox_readonly(self._bpy.context)
 
     def __repr__(self) -> str:
         return "<SafeBpy data+context>"
+
+
+_IMMUTABLE_SANDBOX_TYPES = (type(None), bool, int, float, str, bytes)
+
+
+def _sandbox_readonly(value):
+    if isinstance(value, _IMMUTABLE_SANDBOX_TYPES):
+        return value
+    if isinstance(value, _ReadOnlyBpyProxy):
+        return value
+    return _ReadOnlyBpyProxy(value)
+
+
+class _BlockedBpyCallable:
+    """Placeholder for methods that would escape read-only sandbox access."""
+
+    __slots__ = ("_name",)
+
+    def __init__(self, name: str):
+        self._name = name
+
+    def __call__(self, *_args, **_kwargs):
+        raise TypeError(
+            "Calling bpy methods is not permitted in python.eval_in_sandbox "
+            "({!r} is read-only).".format(self._name)
+        )
+
+    def __repr__(self) -> str:
+        return "<blocked bpy method {!r}>".format(self._name)
+
+
+class _ReadOnlyBpyProxy:
+    """Read-only view over bpy objects, collections, and scalar containers."""
+
+    __slots__ = ("_target",)
+
+    def __init__(self, target):
+        object.__setattr__(self, "_target", target)
+
+    def __getattr__(self, name: str):
+        if name.startswith("_"):
+            raise AttributeError(name)
+        value = getattr(self._target, name)
+        if callable(value):
+            return _BlockedBpyCallable(name)
+        return _sandbox_readonly(value)
+
+    def __getitem__(self, key):
+        return _sandbox_readonly(self._target[key])
+
+    def __iter__(self):
+        return (_sandbox_readonly(item) for item in self._target)
+
+    def __len__(self) -> int:
+        return len(self._target)
+
+    def __bool__(self) -> bool:
+        return bool(self._target)
+
+    def __contains__(self, item) -> bool:
+        if isinstance(item, _ReadOnlyBpyProxy):
+            item = item._target
+        return item in self._target
+
+    def __setattr__(self, name: str, value) -> None:
+        raise TypeError("bpy objects exposed to python.eval_in_sandbox are read-only")
+
+    def __delattr__(self, name: str) -> None:
+        raise TypeError("bpy objects exposed to python.eval_in_sandbox are read-only")
+
+    def keys(self):
+        if isinstance(self._target, Mapping):
+            return tuple(_sandbox_readonly(item) for item in self._target.keys())
+        keys = getattr(self._target, "keys", None)
+        if not callable(keys):
+            raise TypeError("Wrapped bpy object does not provide keys()")
+        return tuple(_sandbox_readonly(item) for item in keys())
+
+    def values(self):
+        if isinstance(self._target, Mapping):
+            return tuple(_sandbox_readonly(item) for item in self._target.values())
+        values = getattr(self._target, "values", None)
+        if not callable(values):
+            raise TypeError("Wrapped bpy object does not provide values()")
+        return tuple(_sandbox_readonly(item) for item in values())
+
+    def items(self):
+        if isinstance(self._target, Mapping):
+            return tuple(
+                (_sandbox_readonly(key), _sandbox_readonly(value))
+                for key, value in self._target.items()
+            )
+        items = getattr(self._target, "items", None)
+        if not callable(items):
+            raise TypeError("Wrapped bpy object does not provide items()")
+        return tuple(
+            (_sandbox_readonly(key), _sandbox_readonly(value))
+            for key, value in items()
+        )
+
+    def get(self, key, default=None):
+        if isinstance(self._target, Mapping):
+            return _sandbox_readonly(self._target.get(key, default))
+        get = getattr(self._target, "get", None)
+        if not callable(get):
+            raise TypeError("Wrapped bpy object does not provide get()")
+        return _sandbox_readonly(get(key, default))
+
+    def __repr__(self) -> str:
+        return "<read-only bpy value {!r}>".format(self._target)
 
 
 def _coerce_for_json(value):
     """Best-effort conversion of arbitrary eval results into JSON-friendly types."""
     if value is None or isinstance(value, (bool, int, float, str)):
         return value
+    if isinstance(value, _ReadOnlyBpyProxy):
+        target = value._target
+        if isinstance(target, Mapping):
+            return {str(k): _coerce_for_json(v) for k, v in target.items()}
+        if isinstance(target, (list, tuple)):
+            return [_coerce_for_json(v) for v in target]
+        if isinstance(target, set):
+            return sorted([_coerce_for_json(v) for v in target], key=repr)
+        return repr(target)
     if isinstance(value, (list, tuple)):
         return [_coerce_for_json(v) for v in value]
     if isinstance(value, dict):

@@ -35,6 +35,15 @@ class _Collection:
         return iter(self._items)
 
 
+class _SceneCollection(dict):
+    """Dict-like ``bpy.data.scenes`` stand-in with Blender-style ``new``."""
+
+    def new(self, name):
+        scene = types.SimpleNamespace(name=name, objects=[])
+        self[name] = scene
+        return scene
+
+
 def _make_object(name, type_="MESH", location=(0, 0, 0), data=None):
     obj = types.SimpleNamespace(
         name=name,
@@ -69,8 +78,10 @@ def _install_bpy_stub(scene_objects=(), ops=None):
         scene=scene,
         view_layer=types.SimpleNamespace(objects=_Collection(scene_objects)),
     )
+    scenes = _SceneCollection({"Scene": scene})
     bpy.data = types.SimpleNamespace(
         objects={obj.name: obj for obj in scene_objects},
+        scenes=scenes,
     )
     bpy.ops = ops if ops is not None else types.SimpleNamespace()
     sys.modules["bpy"] = bpy
@@ -276,6 +287,32 @@ class SystemToolsTest(unittest.TestCase):
             "expression": "sum(range(5))",
         }))
         self.assertEqual(out["result"], 10)
+
+    def test_python_eval_allows_read_only_bpy_traversal(self):
+        cube = _make_object("Cube", location=(1.0, 2.0, 3.0))
+        _install_bpy_stub(scene_objects=[cube])
+        registry, _h, _t = _bootstrap()
+
+        out = json.loads(registry.get("python.eval_in_sandbox").run({
+            "expression": "bpy.data.objects['Cube'].location[0]",
+        }))
+        self.assertEqual(out["result"], 1.0)
+
+    def test_python_eval_blocks_bpy_mutation_methods(self):
+        cube = _make_object("Cube")
+        _install_bpy_stub(scene_objects=[cube])
+        registry, _h, _t = _bootstrap()
+        tool = registry.get("python.eval_in_sandbox")
+
+        with self.assertRaises(ValueError):
+            tool.run({"expression": "bpy.data.objects.pop('Cube')"})
+        with self.assertRaises(ValueError):
+            tool.run({"expression": "bpy.data.scenes.new('Other')"})
+        with self.assertRaises(ValueError):
+            tool.run({"expression": "bpy.data.objects['Cube'].select_set(True)"})
+        self.assertIn("Cube", sys.modules["bpy"].data.objects)
+        self.assertNotIn("Other", sys.modules["bpy"].data.scenes)
+        self.assertFalse(cube.select_get())
 
 
 class ViewportToolsTest(unittest.TestCase):
